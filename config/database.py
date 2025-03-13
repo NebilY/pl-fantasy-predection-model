@@ -10,6 +10,8 @@ import psycopg2
 from psycopg2 import pool
 from dotenv import load_dotenv
 import urllib.parse
+# Add this at the top of the file, after imports
+connection_pool = None
 
 # Load environment variables
 load_dotenv()
