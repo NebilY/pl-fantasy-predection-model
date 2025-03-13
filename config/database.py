@@ -9,6 +9,7 @@ from typing import Any
 import psycopg2
 from psycopg2 import pool
 from dotenv import load_dotenv
+import urllib.parse
 
 # Load environment variables
 load_dotenv()
@@ -16,17 +17,40 @@ load_dotenv()
 # Set up logging
 logger = logging.getLogger(__name__)
 
-# Database configuration
-DB_CONFIG = {
-    'user': os.getenv('DB_USER'),
-    'password': os.getenv('DB_PASSWORD'),
-    'host': os.getenv('DB_HOST'),
-    'port': os.getenv('DB_PORT'),
-    'dbname': os.getenv('DB_NAME')
-}
+def parse_connection_string(connection_string):
+    """
+    Parse PostgreSQL connection string to extract connection parameters.
+    
+    Args:
+        connection_string: PostgreSQL connection string
+        
+    Returns:
+        Dict of connection parameters
+    """
+    # If connection string is not provided as a full URL, use individual config
+    if not connection_string or '@' not in connection_string:
+        return {
+            'user': os.getenv('DB_USER'),
+            'password': os.getenv('DB_PASSWORD'),
+            'host': os.getenv('DB_HOST'),
+            'port': os.getenv('DB_PORT', 5432),
+            'dbname': os.getenv('DB_NAME', 'postgres')
+        }
 
-# Connection pool
-connection_pool = None
+    # Remove any spaces and parse the connection string
+    parsed = urllib.parse.urlparse(connection_string.strip())
+    
+    # Extract components
+    return {
+        'user': parsed.username,
+        'password': parsed.password,
+        'host': parsed.hostname,
+        'port': parsed.port or 5432,
+        'dbname': parsed.path.lstrip('/')
+    }
+
+# Construct connection parameters
+DB_CONFIG = parse_connection_string(os.getenv('DATABASE_URL'))
 
 def get_connection_pool(min_conn=1, max_conn=10):
     """
@@ -47,11 +71,7 @@ def get_connection_pool(min_conn=1, max_conn=10):
             connection_pool = psycopg2.pool.ThreadedConnectionPool(
                 min_conn,
                 max_conn,
-                user=DB_CONFIG['user'],
-                password=DB_CONFIG['password'],
-                host=DB_CONFIG['host'],
-                port=DB_CONFIG['port'],
-                dbname=DB_CONFIG['dbname']
+                **DB_CONFIG
             )
         except Exception as e:
             logger.error(f"Error creating connection pool: {e}")

@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+psycopg2-binary
+python-dotenv
+pandas
+numpy
+scikit-learn
+pulp
+requests
+pydantic
+python-jose
+passlib
+sqlalchemy

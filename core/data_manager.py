@@ -1,21 +1,20 @@
-"""
-Data Manager for FPL Prediction System.
-
-This module handles the collection and storage of Fantasy Premier League data,
-with support for database storage and caching mechanisms.
-"""
-
 import requests
 import pandas as pd
+import numpy as np
 import logging
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Union, Any
+
+# SQLAlchemy imports
+import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import SQLAlchemyError
 
 # Import settings and database connection
 from config import settings
-from config.database import execute_query, get_connection, release_connection
+from config.database import execute_query, get_connection, release_connection, DB_CONFIG
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -35,6 +34,516 @@ class DataManager:
         os.makedirs(settings.RAW_DATA_DIR, exist_ok=True)
         os.makedirs(settings.PROCESSED_DATA_DIR, exist_ok=True)
     
+    def _load_bootstrap_data_from_db(self) -> Optional[Dict]:
+        """
+        Load bootstrap data from database.
+        
+        Returns:
+            Optional[Dict]: Bootstrap data or None if not found
+        """
+        try:
+            query = """
+            SELECT data 
+            FROM bootstrap_static 
+            WHERE season = %s
+            ORDER BY timestamp DESC 
+            LIMIT 1
+            """
+            
+            # Get current season
+            current_season = self.get_current_season()
+            
+            result = execute_query(query, (current_season,))
+            
+            if result and result[0]:
+                logger.info("Bootstrap data loaded from database")
+                return json.loads(result[0][0])
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error loading bootstrap data from database: {e}")
+            return None
+
+    def setup_database_tables(self) -> bool:
+        """
+        Create necessary database tables if they don't exist.
+        
+        Returns:
+            bool: Whether table creation was successful
+        """
+        try:
+            # Create position-specific history tables
+            position_tables = {
+                'goalkeeper_history': [
+                    ('player_id', 'INTEGER'),
+                    ('total_points', 'NUMERIC'),
+                    ('minutes', 'NUMERIC'),
+                    ('clean_sheets', 'NUMERIC'),
+                    ('goals_conceded', 'NUMERIC')
+                ],
+                'defender_history': [
+                    ('player_id', 'INTEGER'),
+                    ('total_points', 'NUMERIC'),
+                    ('minutes', 'NUMERIC'),
+                    ('clean_sheets', 'NUMERIC'),
+                    ('goals_scored', 'NUMERIC'),
+                    ('assists', 'NUMERIC')
+                ],
+                'midfielder_history': [
+                    ('player_id', 'INTEGER'),
+                    ('total_points', 'NUMERIC'),
+                    ('minutes', 'NUMERIC'),
+                    ('goals_scored', 'NUMERIC'),
+                    ('assists', 'NUMERIC')
+                ],
+                'forward_history': [
+                    ('player_id', 'INTEGER'),
+                    ('total_points', 'NUMERIC'),
+                    ('minutes', 'NUMERIC'),
+                    ('goals_scored', 'NUMERIC'),
+                    ('assists', 'NUMERIC')
+                ]
+            }
+            
+            for table_name, columns in position_tables.items():
+                # Construct column definitions
+                column_defs = ', '.join([
+                    f"{col_name} {col_type}" for col_name, col_type in columns
+                ])
+                
+                create_table_query = f"""
+                CREATE TABLE IF NOT EXISTS {table_name} (
+                    id SERIAL PRIMARY KEY,
+                    season VARCHAR(9) NOT NULL,
+                    gameweek INTEGER NOT NULL,
+                    {column_defs},
+                    timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(player_id, season, gameweek)
+                )
+                """
+                execute_query(create_table_query, fetch=False)
+            
+            # Create other necessary tables
+            tables = [
+                (
+                    'player_gameweek_history', 
+                    """
+                    id SERIAL PRIMARY KEY,
+                    player_id INTEGER NOT NULL,
+                    season VARCHAR(9) NOT NULL,
+                    gameweek INTEGER NOT NULL,
+                    total_points INTEGER,
+                    minutes_played INTEGER,
+                    goals_scored INTEGER,
+                    assists INTEGER,
+                    clean_sheet BOOLEAN,
+                    bonus_points INTEGER,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(player_id, season, gameweek)
+                    """
+                ),
+                (
+                    'bootstrap_static', 
+                    """
+                    id SERIAL PRIMARY KEY,
+                    data JSONB NOT NULL,
+                    season VARCHAR(9) NOT NULL,
+                    timestamp TIMESTAMP NOT NULL,
+                    UNIQUE(season)
+                    """
+                ),
+                (
+                    'fixtures', 
+                    """
+                    id SERIAL PRIMARY KEY,
+                    data JSONB NOT NULL,
+                    season VARCHAR(9) NOT NULL,
+                    timestamp TIMESTAMP NOT NULL,
+                    UNIQUE(season)
+                    """
+                ),
+                (
+                    'player_data', 
+                    """
+                    id SERIAL PRIMARY KEY,
+                    player_id INTEGER NOT NULL,
+                    season VARCHAR(9) NOT NULL,
+                    data JSONB NOT NULL,
+                    timestamp TIMESTAMP NOT NULL,
+                    UNIQUE(player_id, season)
+                    """
+                )
+            ]
+            
+            for table_name, columns in tables:
+                create_table_query = f"""
+                CREATE TABLE IF NOT EXISTS {table_name} (
+                    {columns}
+                )
+                """
+                execute_query(create_table_query, fetch=False)
+            
+            logger.info("Database tables created successfully")
+            return True
+        except Exception as e:
+            logger.error(f"Error creating database tables: {e}")
+            return False
+
+    # Rest of the methods remain the same...
+"""
+Data Manager for FPL Prediction System.
+
+This module handles the collection and storage of Fantasy Premier League data,
+with support for database storage and caching mechanisms.
+"""
+
+import requests
+import pandas as pd
+import numpy as np
+import logging
+import os
+import json
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Union, Any
+
+# SQLAlchemy imports
+import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import SQLAlchemyError
+
+# Import settings and database connection
+from config import settings
+from config.database import execute_query, get_connection, release_connection, DB_CONFIG
+
+# Set up logging
+logger = logging.getLogger(__name__)
+
+class DataManager:
+    """
+    Handles the collection, storage, and retrieval of FPL data.
+    """
+    
+    def __init__(self):
+        """Initialize the Data Manager."""
+        self.current_gw = None
+        self.bootstrap_data = None
+        self.fixtures_data = None
+        
+        # Create required directories for any file-based outputs
+        os.makedirs(settings.RAW_DATA_DIR, exist_ok=True)
+        os.makedirs(settings.PROCESSED_DATA_DIR, exist_ok=True)
+    
+    def get_current_season(self) -> str:
+        """
+        Determine the current FPL season.
+        
+        Returns:
+            str: Current season in format '2023/2024'
+        """
+        current_date = datetime.now()
+        current_year = current_date.year
+        
+        # FPL season typically starts in August and ends in May
+        if current_date.month >= 8:
+            return f"{current_year}/{current_year + 1}"
+        else:
+            return f"{current_year - 1}/{current_year}"
+    
+    def store_player_gameweek_history(self, player_data: List[Dict[str, Any]]) -> None:
+        """
+        Store detailed player gameweek performance.
+        
+        Args:
+            player_data: List of player performance dictionaries
+        """
+        try:
+            # Get current season
+            current_season = self.get_current_season()
+            
+            # Create SQLAlchemy engine
+            engine = sa.create_engine(
+                f"postgresql://{DB_CONFIG['user']}:{DB_CONFIG['password']}@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['dbname']}"
+            )
+            
+            # Prepare data for bulk insert with upsert logic
+            processed_data = []
+            for entry in player_data:
+                processed_entry = {
+                    'player_id': entry.get('player_id'),
+                    'season': current_season,
+                    'gameweek': entry.get('round'),
+                    'total_points': entry.get('total_points'),
+                    'minutes_played': entry.get('minutes'),
+                    'goals_scored': entry.get('goals_scored', 0),
+                    'assists': entry.get('assists', 0),
+                    'clean_sheet': entry.get('clean_sheets', 0) > 0,
+                    'bonus_points': entry.get('bonus', 0)
+                }
+                processed_data.append(processed_entry)
+            
+            # Create table if not exists
+            metadata = sa.MetaData()
+            table = sa.Table(
+                'player_gameweek_history', 
+                metadata,
+                sa.Column('id', sa.Integer, primary_key=True),
+                sa.Column('player_id', sa.Integer, nullable=False),
+                sa.Column('season', sa.String(9), nullable=False),
+                sa.Column('gameweek', sa.Integer, nullable=False),
+                sa.Column('total_points', sa.Integer),
+                sa.Column('minutes_played', sa.Integer),
+                sa.Column('goals_scored', sa.Integer),
+                sa.Column('assists', sa.Integer),
+                sa.Column('clean_sheet', sa.Boolean),
+                sa.Column('bonus_points', sa.Integer),
+                sa.Column('timestamp', sa.DateTime, default=sa.func.now()),
+                sa.UniqueConstraint('player_id', 'season', 'gameweek')
+            )
+            
+            # Create table if not exists
+            metadata.create_all(engine)
+            
+            # Upsert operation
+            with engine.connect() as conn:
+                for entry in processed_data:
+                    # Create an INSERT statement
+                    stmt = insert(table).values(entry)
+                    
+                    # Create an ON CONFLICT (UPSERT) statement
+                    upsert_stmt = stmt.on_conflict_do_update(
+                        index_elements=['player_id', 'season', 'gameweek'],
+                        set_={
+                            'total_points': stmt.excluded.total_points,
+                            'minutes_played': stmt.excluded.minutes_played,
+                            'goals_scored': stmt.excluded.goals_scored,
+                            'assists': stmt.excluded.assists,
+                            'clean_sheet': stmt.excluded.clean_sheet,
+                            'bonus_points': stmt.excluded.bonus_points
+                        }
+                    )
+                    
+                    # Execute the upsert
+                    conn.execute(upsert_stmt)
+            
+            logger.info(f"Stored {len(processed_data)} player gameweek records")
+        
+        except SQLAlchemyError as e:
+            logger.error(f"SQLAlchemy error storing player gameweek history: {e}")
+        except Exception as e:
+            logger.error(f"Error storing player gameweek history: {e}")
+    
+    def setup_database_tables(self) -> bool:
+        """
+        Create necessary database tables if they don't exist.
+        
+        Returns:
+            bool: Whether table creation was successful
+        """
+        try:
+            # SQL statements for creating tables
+            create_table_queries = [
+                """
+                CREATE TABLE IF NOT EXISTS goalkeeper_history (
+                    id SERIAL PRIMARY KEY,
+                    season VARCHAR(9) NOT NULL,
+                    gameweek INTEGER NOT NULL,
+                    player_id INTEGER NOT NULL,
+                    total_points NUMERIC,
+                    minutes NUMERIC,
+                    clean_sheets NUMERIC,
+                    goals_conceded NUMERIC,
+                    timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(player_id, season, gameweek)
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS defender_history (
+                    id SERIAL PRIMARY KEY,
+                    season VARCHAR(9) NOT NULL,
+                    gameweek INTEGER NOT NULL,
+                    player_id INTEGER NOT NULL,
+                    total_points NUMERIC,
+                    minutes NUMERIC,
+                    clean_sheets NUMERIC,
+                    goals_scored NUMERIC,
+                    assists NUMERIC,
+                    timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(player_id, season, gameweek)
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS midfielder_history (
+                    id SERIAL PRIMARY KEY,
+                    season VARCHAR(9) NOT NULL,
+                    gameweek INTEGER NOT NULL,
+                    player_id INTEGER NOT NULL,
+                    total_points NUMERIC,
+                    minutes NUMERIC,
+                    goals_scored NUMERIC,
+                    assists NUMERIC,
+                    timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(player_id, season, gameweek)
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS forward_history (
+                    id SERIAL PRIMARY KEY,
+                    season VARCHAR(9) NOT NULL,
+                    gameweek INTEGER NOT NULL,
+                    player_id INTEGER NOT NULL,
+                    total_points NUMERIC,
+                    minutes NUMERIC,
+                    goals_scored NUMERIC,
+                    assists NUMERIC,
+                    timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(player_id, season, gameweek)
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS player_gameweek_history (
+                    id SERIAL PRIMARY KEY,
+                    player_id INTEGER NOT NULL,
+                    season VARCHAR(9) NOT NULL,
+                    gameweek INTEGER NOT NULL,
+                    total_points INTEGER,
+                    minutes_played INTEGER,
+                    goals_scored INTEGER,
+                    assists INTEGER,
+                    clean_sheet BOOLEAN,
+                    bonus_points INTEGER,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(player_id, season, gameweek)
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS bootstrap_static (
+                    id SERIAL PRIMARY KEY,
+                    data JSONB NOT NULL,
+                    season VARCHAR(9) NOT NULL,
+                    timestamp TIMESTAMP NOT NULL,
+                    UNIQUE(season)
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS fixtures (
+                    id SERIAL PRIMARY KEY,
+                    data JSONB NOT NULL,
+                    season VARCHAR(9) NOT NULL,
+                    timestamp TIMESTAMP NOT NULL,
+                    UNIQUE(season)
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS player_data (
+                    id SERIAL PRIMARY KEY,
+                    player_id INTEGER NOT NULL,
+                    season VARCHAR(9) NOT NULL,
+                    data JSONB NOT NULL,
+                    timestamp TIMESTAMP NOT NULL,
+                    UNIQUE(player_id, season)
+                )
+                """
+            ]
+            
+            # Execute each create table query
+            for query in create_table_queries:
+                execute_query(query, fetch=False)
+            
+            logger.info("Database tables created successfully")
+            return True
+        except Exception as e:
+            logger.error(f"Error creating database tables: {e}")
+            return False
+    
+    def _store_position_data(self, position: str, data: pd.DataFrame) -> None:
+        """
+        Store position data in database with seasonal context.
+        
+        Args:
+            position: Position code (GK, DEF, MID, FWD)
+            data: DataFrame of player data
+        """
+        try:
+            # Determine current season
+            current_season = self.get_current_season()
+            
+            # Create SQLAlchemy engine
+            engine = sa.create_engine(
+                f"postgresql://{DB_CONFIG['user']}:{DB_CONFIG['password']}@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['dbname']}"
+            )
+            
+            # Prepare data for bulk insert
+            table_name = f"{position.lower()}_history"
+            
+            # Add seasonal and gameweek context
+            data['season'] = current_season
+            data['timestamp'] = datetime.now()
+            
+            try:
+                # Write DataFrame to PostgreSQL with upsert logic
+                with engine.begin() as conn:
+                    # Use pandas to_sql with if_exists='append'
+                    data.to_sql(
+                        table_name, 
+                        conn, 
+                        if_exists='append',  # Append new data
+                        index=False,
+                        method='multi'  # Batch insert for performance
+                    )
+                
+                logger.info(f"{position} position data stored in database")
+                
+            except Exception as e:
+                logger.error(f"Error storing {position} data to database: {e}")
+                # Fall back to file storage
+                file_path = os.path.join(settings.PROCESSED_DATA_DIR, f'{position.lower()}_history.csv')
+                data.to_csv(file_path, index=False)
+                logger.info(f"{position} data stored in file: {file_path}")
+            
+        except Exception as e:
+            logger.error(f"Error setting up database storage for {position}: {e}")
+            # Fall back to file storage
+            file_path = os.path.join(settings.PROCESSED_DATA_DIR, f'{position.lower()}_history.csv')
+            data.to_csv(file_path, index=False)
+            logger.info(f"{position} data stored in file: {file_path}")
+    
+    # ... (rest of the existing methods remain the same)
+    
+    def collect_all_position_data(self) -> Dict[str, pd.DataFrame]:
+        """
+        Collect data for all positions.
+        
+        Returns:
+            Dict[str, pd.DataFrame]: Dictionary of position data
+        """
+        # First fetch bootstrap if not already done
+        if self.bootstrap_data is None:
+            db_data = self._load_bootstrap_data_from_db()
+            if db_data:
+                self.bootstrap_data = db_data
+            else:
+                self.fetch_bootstrap_static()
+            
+        # Fetch fixtures if not already done
+        if self.fixtures_data is None:
+            self.fetch_fixtures()
+            
+        # Collect data for each position
+        position_data = {}
+        position_ids = {1: 'GK', 2: 'DEF', 3: 'MID', 4: 'FWD'}
+        
+        for position_id, position_name in position_ids.items():
+            logger.info(f"Collecting data for {position_name} position")
+            position_df = self.collect_player_data_by_position(position_id)
+            
+            # Store position-specific data in database
+            if not position_df.empty:
+                self._store_position_data(position_name, position_df)
+            
+            position_data[position_name] = position_df
+            
+        return position_data
+    
     def fetch_bootstrap_static(self) -> Dict:
         """
         Fetch the main FPL API data including teams, players, and gameweeks.
@@ -48,18 +557,18 @@ class DataManager:
             response.raise_for_status()
             self.bootstrap_data = response.json()
             
-            # Store data in database
-            self._store_bootstrap_data()
-            
             # Determine current gameweek
             self._determine_current_gameweek()
+            
+            # Store bootstrap data
+            self._store_bootstrap_data()
             
             return self.bootstrap_data
             
         except requests.RequestException as e:
             logger.error(f"Error fetching bootstrap static: {e}")
             raise
-    
+
     def fetch_fixtures(self) -> List[Dict]:
         """
         Fetch all fixtures data from the FPL API.
@@ -73,7 +582,7 @@ class DataManager:
             response.raise_for_status()
             self.fixtures_data = response.json()
             
-            # Store fixtures in database
+            # Store fixtures data
             self._store_fixtures_data()
             
             return self.fixtures_data
@@ -81,128 +590,127 @@ class DataManager:
         except requests.RequestException as e:
             logger.error(f"Error fetching fixtures: {e}")
             raise
-    
-    def fetch_player_history(self, player_id: int) -> Dict:
+
+    def _store_bootstrap_data(self) -> None:
         """
-        Fetch detailed history data for a specific player.
-        
-        Args:
-            player_id: The FPL ID of the player
-            
-        Returns:
-            Dict: Player history data
+        Store bootstrap static data in the database.
         """
         try:
-            logger.info(f"Fetching history for player {player_id}")
-            url = f"{settings.FPL_PLAYER_SUMMARY_URL}{player_id}/"
-            response = requests.get(url)
-            response.raise_for_status()
-            player_data = response.json()
+            # Get current season
+            current_season = self.get_current_season()
             
-            # Store player data in database
-            self._store_player_data(player_id, player_data)
+            # Convert to JSON string
+            data_json = json.dumps(self.bootstrap_data)
             
-            return player_data
+            # Create SQLAlchemy engine
+            engine = sa.create_engine(
+                f"postgresql://{DB_CONFIG['user']}:{DB_CONFIG['password']}@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['dbname']}"
+            )
             
-        except requests.RequestException as e:
-            logger.error(f"Error fetching player {player_id} history: {e}")
-            raise
-    
-    def get_players_by_position(self, position_id: int) -> pd.DataFrame:
-        """
-        Get all players of a specific position.
-        
-        Args:
-            position_id: Position ID (1=GK, 2=DEF, 3=MID, 4=FWD)
+            # Create metadata
+            metadata = sa.MetaData()
+            table = sa.Table(
+                'bootstrap_static', 
+                metadata,
+                sa.Column('id', sa.Integer, primary_key=True),
+                sa.Column('data', sa.JSON, nullable=False),
+                sa.Column('season', sa.String(9), nullable=False),
+                sa.Column('timestamp', sa.DateTime, default=sa.func.now())
+            )
             
-        Returns:
-            pd.DataFrame: DataFrame of players
-        """
-        if self.bootstrap_data is None:
-            # Try to fetch from database first
-            db_data = self._load_bootstrap_data_from_db()
-            if db_data:
-                self.bootstrap_data = db_data
-            else:
-                # If not in database, fetch from API
-                self.fetch_bootstrap_static()
-        
-        # Filter players by position
-        players = [p for p in self.bootstrap_data['elements'] if p['element_type'] == position_id]
-        return pd.DataFrame(players)
-    
-    def collect_player_data_by_position(self, position_id: int) -> pd.DataFrame:
-        """
-        Collect detailed data for all players in a position.
-        
-        Args:
-            position_id: Position ID (1=GK, 2=DEF, 3=MID, 4=FWD)
+            # Create table if not exists
+            metadata.create_all(engine)
             
-        Returns:
-            pd.DataFrame: Complete player data with history
-        """
-        # Check if data already exists in database
-        position_names = {1: 'GK', 2: 'DEF', 3: 'MID', 4: 'FWD'}
-        position_name = position_names.get(position_id, 'UNK')
-        
-        # Check if we already have recent data for this position
-        existing_data = self._load_position_data_from_db(position_name)
-        if existing_data is not None:
-            logger.info(f"Using existing {position_name} data from database")
-            return existing_data
-        
-        # Get players of this position
-        players_df = self.get_players_by_position(position_id)
-        
-        # Team mapping
-        team_map = {team['id']: team['name'] for team in self.bootstrap_data['teams']}
-        
-        # Collect history for each player
-        player_histories = []
-        
-        for _, player in players_df.iterrows():
-            player_id = player['id']
-            
-            try:
-                # Check if player data exists in database
-                db_player_data = self._load_player_data_from_db(player_id)
+            # Upsert operation
+            with engine.connect() as conn:
+                # Create an INSERT statement
+                stmt = insert(table).values({
+                    'data': data_json,
+                    'season': current_season
+                })
                 
-                if db_player_data:
-                    player_data = db_player_data
-                else:
-                    # Get player history from API
-                    player_data = self.fetch_player_history(player_id)
+                # Create an ON CONFLICT (UPSERT) statement
+                upsert_stmt = stmt.on_conflict_do_update(
+                    index_elements=['season'],
+                    set_={
+                        'data': stmt.excluded.data,
+                        'timestamp': sa.func.now()
+                    }
+                )
                 
-                # Process current season history
-                if 'history' in player_data and player_data['history']:
-                    for match in player_data['history']:
-                        match_data = match.copy()
-                        # Add player details
-                        match_data['player_id'] = player_id
-                        match_data['player_name'] = player['web_name']
-                        match_data['team_id'] = player['team']
-                        match_data['team_name'] = team_map.get(player['team'], "Unknown")
-                        match_data['position'] = position_name
-                        match_data['cost'] = player['now_cost'] / 10
-                        
-                        player_histories.append(match_data)
+                # Execute the upsert
+                conn.execute(upsert_stmt)
             
-            except Exception as e:
-                logger.error(f"Error processing player {player_id}: {e}")
-                continue
-        
-        # Convert to DataFrame
-        if player_histories:
-            history_df = pd.DataFrame(player_histories)
+            logger.info("Bootstrap data stored in database")
             
-            # Store processed data in database
-            self._store_position_data(position_name, history_df)
+        except Exception as e:
+            logger.error(f"Error storing bootstrap data: {e}")
+            # Fall back to file storage
+            file_path = os.path.join(settings.RAW_DATA_DIR, 'bootstrap_static.json')
+            with open(file_path, 'w') as f:
+                json.dump(self.bootstrap_data, f, indent=2)
+            logger.info(f"Bootstrap data stored in file: {file_path}")
+
+    def _store_fixtures_data(self) -> None:
+        """
+        Store fixtures data in the database.
+        """
+        try:
+            # Get current season
+            current_season = self.get_current_season()
             
-            return history_df
-        else:
-            logger.warning(f"No history data collected for position {position_name}")
-            return pd.DataFrame()
-    
+            # Convert to JSON string
+            data_json = json.dumps(self.fixtures_data)
+            
+            # Create SQLAlchemy engine
+            engine = sa.create_engine(
+                f"postgresql://{DB_CONFIG['user']}:{DB_CONFIG['password']}@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['dbname']}"
+            )
+            
+            # Create metadata
+            metadata = sa.MetaData()
+            table = sa.Table(
+                'fixtures', 
+                metadata,
+                sa.Column('id', sa.Integer, primary_key=True),
+                sa.Column('data', sa.JSON, nullable=False),
+                sa.Column('season', sa.String(9), nullable=False),
+                sa.Column('timestamp', sa.DateTime, default=sa.func.now())
+            )
+            
+            # Create table if not exists
+            metadata.create_all(engine)
+            
+            # Upsert operation
+            with engine.connect() as conn:
+                # Create an INSERT statement
+                stmt = insert(table).values({
+                    'data': data_json,
+                    'season': current_season
+                })
+                
+                # Create an ON CONFLICT (UPSERT) statement
+                upsert_stmt = stmt.on_conflict_do_update(
+                    index_elements=['season'],
+                    set_={
+                        'data': stmt.excluded.data,
+                        'timestamp': sa.func.now()
+                    }
+                )
+                
+                # Execute the upsert
+                conn.execute(upsert_stmt)
+            
+            logger.info("Fixtures data stored in database")
+            
+        except Exception as e:
+            logger.error(f"Error storing fixtures data: {e}")
+            # Fall back to file storage
+            file_path = os.path.join(settings.RAW_DATA_DIR, 'fixtures.json')
+            with open(file_path, 'w') as f:
+                json.dump(self.fixtures_data, f, indent=2)
+            logger.info(f"Fixtures data stored in file: {file_path}")
+
     def _determine_current_gameweek(self) -> int:
         """
         Determine the current or next gameweek from bootstrap data.
@@ -230,388 +738,3 @@ class DataManager:
         self.current_gw = events[0]['id'] if events else 1
         logger.info(f"Using gameweek: {self.current_gw}")
         return self.current_gw
-    
-    def _store_bootstrap_data(self) -> None:
-        """Store bootstrap data in database."""
-        try:
-            # Convert to JSON string
-            data_json = json.dumps(self.bootstrap_data)
-            
-            # Check if data already exists
-            check_query = "SELECT COUNT(*) FROM bootstrap_static WHERE timestamp::date = CURRENT_DATE"
-            result = execute_query(check_query)
-            
-            if result[0][0] == 0:
-                # Insert new data
-                insert_query = """
-                INSERT INTO bootstrap_static (data, timestamp)
-                VALUES (%s, %s)
-                """
-                execute_query(insert_query, (data_json, datetime.now()), fetch=False)
-                logger.info("Bootstrap data stored in database")
-            else:
-                # Update existing data
-                update_query = """
-                UPDATE bootstrap_static 
-                SET data = %s, timestamp = %s
-                WHERE timestamp::date = CURRENT_DATE
-                """
-                execute_query(update_query, (data_json, datetime.now()), fetch=False)
-                logger.info("Bootstrap data updated in database")
-                
-        except Exception as e:
-            logger.error(f"Error storing bootstrap data: {e}")
-            # Fall back to file storage
-            file_path = os.path.join(settings.RAW_DATA_DIR, 'bootstrap_static.json')
-            with open(file_path, 'w') as f:
-                json.dump(self.bootstrap_data, f, indent=2)
-            logger.info(f"Bootstrap data stored in file: {file_path}")
-    
-    def _store_fixtures_data(self) -> None:
-        """Store fixtures data in database."""
-        try:
-            # Convert to JSON string
-            data_json = json.dumps(self.fixtures_data)
-            
-            # Check if data already exists
-            check_query = "SELECT COUNT(*) FROM fixtures WHERE timestamp::date = CURRENT_DATE"
-            result = execute_query(check_query)
-            
-            if result[0][0] == 0:
-                # Insert new data
-                insert_query = """
-                INSERT INTO fixtures (data, timestamp)
-                VALUES (%s, %s)
-                """
-                execute_query(insert_query, (data_json, datetime.now()), fetch=False)
-                logger.info("Fixtures data stored in database")
-            else:
-                # Update existing data
-                update_query = """
-                UPDATE fixtures 
-                SET data = %s, timestamp = %s
-                WHERE timestamp::date = CURRENT_DATE
-                """
-                execute_query(update_query, (data_json, datetime.now()), fetch=False)
-                logger.info("Fixtures data updated in database")
-                
-        except Exception as e:
-            logger.error(f"Error storing fixtures data: {e}")
-            # Fall back to file storage
-            file_path = os.path.join(settings.RAW_DATA_DIR, 'fixtures.json')
-            with open(file_path, 'w') as f:
-                json.dump(self.fixtures_data, f, indent=2)
-            logger.info(f"Fixtures data stored in file: {file_path}")
-    
-    def _store_player_data(self, player_id: int, player_data: Dict) -> None:
-        """
-        Store player data in database.
-        
-        Args:
-            player_id: Player ID
-            player_data: Player data dictionary
-        """
-        try:
-            # Convert to JSON string
-            data_json = json.dumps(player_data)
-            
-            # Check if data already exists
-            check_query = "SELECT COUNT(*) FROM player_data WHERE player_id = %s AND timestamp::date = CURRENT_DATE"
-            result = execute_query(check_query, (player_id,))
-            
-            if result[0][0] == 0:
-                # Insert new data
-                insert_query = """
-                INSERT INTO player_data (player_id, data, timestamp)
-                VALUES (%s, %s, %s)
-                """
-                execute_query(insert_query, (player_id, data_json, datetime.now()), fetch=False)
-                logger.info(f"Player {player_id} data stored in database")
-            else:
-                # Update existing data
-                update_query = """
-                UPDATE player_data 
-                SET data = %s, timestamp = %s
-                WHERE player_id = %s AND timestamp::date = CURRENT_DATE
-                """
-                execute_query(update_query, (data_json, datetime.now(), player_id), fetch=False)
-                logger.info(f"Player {player_id} data updated in database")
-                
-        except Exception as e:
-            logger.error(f"Error storing player {player_id} data: {e}")
-            # Fall back to file storage
-            file_path = os.path.join(settings.RAW_DATA_DIR, f'player_{player_id}.json')
-            with open(file_path, 'w') as f:
-                json.dump(player_data, f, indent=2)
-            logger.info(f"Player {player_id} data stored in file: {file_path}")
-    
-    def _store_position_data(self, position: str, data: pd.DataFrame) -> None:
-        """
-        Store position data in database.
-        
-        Args:
-            position: Position code (GK, DEF, MID, FWD)
-            data: DataFrame of player data
-        """
-        try:
-            conn = get_connection()
-            try:
-                # Create temporary table
-                temp_table = f"temp_{position.lower()}_history"
-                table_name = f"{position.lower()}_history"
-                
-                # Drop temp table if exists
-                cursor = conn.cursor()
-                cursor.execute(f"DROP TABLE IF EXISTS {temp_table}")
-                
-                # Write DataFrame to temporary table
-                data.to_sql(temp_table, conn, index=False, if_exists='replace')
-                
-                # Check if main table exists
-                cursor.execute(f"""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables 
-                    WHERE table_name = '{table_name}'
-                )
-                """)
-                table_exists = cursor.fetchone()[0]
-                
-                if not table_exists:
-                    # Create main table from temp
-                    cursor.execute(f"""
-                    CREATE TABLE {table_name} AS
-                    SELECT *, CURRENT_TIMESTAMP AS timestamp
-                    FROM {temp_table}
-                    """)
-                else:
-                    # Delete current day's data
-                    cursor.execute(f"""
-                    DELETE FROM {table_name}
-                    WHERE timestamp::date = CURRENT_DATE
-                    """)
-                    
-                    # Insert new data
-                    cursor.execute(f"""
-                    INSERT INTO {table_name}
-                    SELECT *, CURRENT_TIMESTAMP AS timestamp
-                    FROM {temp_table}
-                    """)
-                
-                # Drop temp table
-                cursor.execute(f"DROP TABLE IF EXISTS {temp_table}")
-                
-                # Commit changes
-                conn.commit()
-                logger.info(f"{position} position data stored in database")
-                
-            except Exception as e:
-                conn.rollback()
-                raise e
-            finally:
-                release_connection(conn)
-                
-        except Exception as e:
-            logger.error(f"Error storing {position} data: {e}")
-            # Fall back to file storage
-            file_path = os.path.join(settings.PROCESSED_DATA_DIR, f'{position.lower()}_history.csv')
-            data.to_csv(file_path, index=False)
-            logger.info(f"{position} data stored in file: {file_path}")
-    
-    def _load_bootstrap_data_from_db(self) -> Optional[Dict]:
-        """
-        Load bootstrap data from database.
-        
-        Returns:
-            Optional[Dict]: Bootstrap data or None if not found
-        """
-        try:
-            query = """
-            SELECT data 
-            FROM bootstrap_static 
-            WHERE timestamp::date = CURRENT_DATE
-            ORDER BY timestamp DESC 
-            LIMIT 1
-            """
-            
-            result = execute_query(query)
-            
-            if result and result[0]:
-                logger.info("Bootstrap data loaded from database")
-                return json.loads(result[0][0])
-            return None
-            
-        except Exception as e:
-            logger.error(f"Error loading bootstrap data from database: {e}")
-            return None
-    
-    def _load_player_data_from_db(self, player_id: int) -> Optional[Dict]:
-        """
-        Load player data from database.
-        
-        Args:
-            player_id: Player ID
-            
-        Returns:
-            Optional[Dict]: Player data or None if not found
-        """
-        try:
-            query = """
-            SELECT data 
-            FROM player_data 
-            WHERE player_id = %s AND timestamp::date = CURRENT_DATE
-            ORDER BY timestamp DESC 
-            LIMIT 1
-            """
-            
-            result = execute_query(query, (player_id,))
-            
-            if result and result[0]:
-                logger.info(f"Player {player_id} data loaded from database")
-                return json.loads(result[0][0])
-            return None
-            
-        except Exception as e:
-            logger.error(f"Error loading player data from database: {e}")
-            return None
-    
-    def _load_position_data_from_db(self, position: str) -> Optional[pd.DataFrame]:
-        """
-        Load position data from database.
-        
-        Args:
-            position: Position code (GK, DEF, MID, FWD)
-            
-        Returns:
-            Optional[pd.DataFrame]: Position data or None if not found
-        """
-        try:
-            conn = get_connection()
-            table_name = f"{position.lower()}_history"
-            
-            # Check if table exists and has today's data
-            check_query = f"""
-            SELECT EXISTS (
-                SELECT FROM information_schema.tables 
-                WHERE table_name = '{table_name}'
-            )
-            """
-            
-            result = execute_query(check_query)
-            
-            if result[0][0]:
-                # Table exists, check for today's data
-                check_today_query = f"""
-                SELECT COUNT(*) 
-                FROM {table_name}
-                WHERE timestamp::date = CURRENT_DATE
-                """
-                
-                today_result = execute_query(check_today_query)
-                
-                if today_result[0][0] > 0:
-                    # Data exists for today
-                    query = f"""
-                    SELECT * 
-                    FROM {table_name}
-                    WHERE timestamp::date = CURRENT_DATE
-                    """
-                    
-                    # Use pandas to read from database
-                    df = pd.read_sql(query, conn)
-                    logger.info(f"{position} data loaded from database")
-                    return df
-            
-            return None
-            
-        except Exception as e:
-            logger.error(f"Error loading {position} data from database: {e}")
-            return None
-        finally:
-            release_connection(conn)
-    
-    def get_current_gameweek(self) -> int:
-        """
-        Get the current gameweek number.
-        
-        Returns:
-            int: Current gameweek number
-        """
-        if self.current_gw is None:
-            if self.bootstrap_data is None:
-                db_data = self._load_bootstrap_data_from_db()
-                if db_data:
-                    self.bootstrap_data = db_data
-                else:
-                    self.fetch_bootstrap_static()
-            self._determine_current_gameweek()
-            
-        return self.current_gw
-    
-    def collect_all_position_data(self) -> Dict[str, pd.DataFrame]:
-        """
-        Collect data for all positions.
-        
-        Returns:
-            Dict[str, pd.DataFrame]: Dictionary of position data
-        """
-        # First fetch bootstrap if not already done
-        if self.bootstrap_data is None:
-            db_data = self._load_bootstrap_data_from_db()
-            if db_data:
-                self.bootstrap_data = db_data
-            else:
-                self.fetch_bootstrap_static()
-            
-        # Fetch fixtures if not already done
-        if self.fixtures_data is None:
-            self.fetch_fixtures()
-            
-        # Collect data for each position
-        position_data = {}
-        position_ids = {1: 'GK', 2: 'DEF', 3: 'MID', 4: 'FWD'}
-        
-        for position_id, position_name in position_ids.items():
-            logger.info(f"Collecting data for {position_name} position")
-            position_data[position_name] = self.collect_player_data_by_position(position_id)
-            
-        return position_data
-    
-    def setup_database_tables(self):
-        """Create necessary database tables if they don't exist."""
-        try:
-            # Create bootstrap_static table
-            bootstrap_query = """
-            CREATE TABLE IF NOT EXISTS bootstrap_static (
-                id SERIAL PRIMARY KEY,
-                data JSONB NOT NULL,
-                timestamp TIMESTAMP NOT NULL
-            )
-            """
-            execute_query(bootstrap_query, fetch=False)
-            
-            # Create fixtures table
-            fixtures_query = """
-            CREATE TABLE IF NOT EXISTS fixtures (
-                id SERIAL PRIMARY KEY,
-                data JSONB NOT NULL,
-                timestamp TIMESTAMP NOT NULL
-            )
-            """
-            execute_query(fixtures_query, fetch=False)
-            
-            # Create player_data table
-            player_query = """
-            CREATE TABLE IF NOT EXISTS player_data (
-                id SERIAL PRIMARY KEY,
-                player_id INTEGER NOT NULL,
-                data JSONB NOT NULL,
-                timestamp TIMESTAMP NOT NULL
-            )
-            """
-            execute_query(player_query, fetch=False)
-            
-            logger.info("Database tables created successfully")
-            return True
-        except Exception as e:
-            logger.error(f"Error creating database tables: {e}")
-            return False
